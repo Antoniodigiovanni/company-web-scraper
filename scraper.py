@@ -210,3 +210,103 @@ def _extract_text(html: str) -> str:
         return ""
     result = trafilatura.extract(html, include_comments=False, favor_precision=True)
     return result or ""
+
+
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
+
+
+class CompanyScraper:
+    """Scrape the text from company websites for downstream business description generation.
+
+    Databricks setup required once per cluster:
+        %pip install curl_cffi trafilatura lxml pandas playwright
+        !playwright install chromium
+
+    Args:
+        max_subpages: Total pages to scrape per company (including homepage). Default 8.
+        high_value_keywords: URL path keywords scoring +2. Defaults to _DEFAULT_HIGH.
+        low_value_keywords: URL path keywords scoring -1. Defaults to _DEFAULT_LOW.
+        retry_mode: "none" | "minimal" | "full". See module docstring.
+        impersonate_profiles: curl_cffi impersonation profiles to rotate through.
+        timeout_s: Per-request timeout in seconds.
+        subpage_workers: ThreadPoolExecutor workers for parallel subpage fetching.
+        js_fallback: If True, escalate blocked/empty pages to Playwright.
+        output_delta_path: If set, append results DataFrame to this Delta table.
+        delta_log_path: If set, append per-company log rows to this Delta table.
+        persist_raw_html: If True, write raw HTML to {output_delta_path}_raw Delta table.
+            Requires output_delta_path.
+        spark: SparkSession to use. If None, uses SparkSession.getActiveSession().
+    """
+
+    def __init__(
+        self,
+        max_subpages: int = 8,
+        high_value_keywords: list[str] | None = None,
+        low_value_keywords: list[str] | None = None,
+        retry_mode: Literal["none", "minimal", "full"] = "full",
+        impersonate_profiles: tuple = ("chrome124", "safari17_2", "firefox133"),
+        timeout_s: float = 15.0,
+        subpage_workers: int = 5,
+        js_fallback: bool = True,
+        output_delta_path: str | None = None,
+        delta_log_path: str | None = None,
+        persist_raw_html: bool = False,
+        spark=None,
+    ) -> None:
+        if persist_raw_html and not output_delta_path:
+            raise ValueError("persist_raw_html=True requires output_delta_path to be set.")
+
+        self._spark = spark
+        if (output_delta_path or delta_log_path) and self._spark is None:
+            try:
+                from pyspark.sql import SparkSession
+                self._spark = SparkSession.getActiveSession()
+                if self._spark is None:
+                    raise RuntimeError(
+                        "No active Spark session found. Pass spark= or run on Databricks."
+                    )
+            except ImportError:
+                raise RuntimeError(
+                    "PySpark not available. Delta persistence requires a Databricks runtime."
+                )
+
+        self.max_subpages = max_subpages
+        self.high_value_keywords = high_value_keywords if high_value_keywords is not None else list(_DEFAULT_HIGH)
+        self.low_value_keywords = low_value_keywords if low_value_keywords is not None else list(_DEFAULT_LOW)
+        self.retry_mode = retry_mode
+        self.impersonate_profiles = tuple(impersonate_profiles)
+        self.timeout_s = timeout_s
+        self.subpage_workers = subpage_workers
+        self.js_fallback = js_fallback
+        self.output_delta_path = output_delta_path
+        self.delta_log_path = delta_log_path
+        self.persist_raw_html = persist_raw_html
+
+        self._browser = None
+        self._playwright_ctx = None
+
+    def close(self) -> None:
+        if getattr(self, "_browser", None) is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if getattr(self, "_playwright_ctx", None) is not None:
+            try:
+                self._playwright_ctx.stop()
+            except Exception:
+                pass
+            self._playwright_ctx = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __del__(self):
+        self.close()

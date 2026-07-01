@@ -1,3 +1,4 @@
+import pytest
 from unittest.mock import MagicMock, call, patch
 
 import scraper  # noqa: F401
@@ -6,6 +7,7 @@ from scraper import (
     _parse_anchor_links, _parse_sitemap, _url_slug, _score_url, _rank_and_pick,
     _extract_text,
 )
+from scraper import CompanyScraper
 
 
 def test_module_imports():
@@ -304,3 +306,40 @@ class TestExtractText:
         text = _extract_text(_ARTICLE_HTML)
         # trafilatura with favor_precision=True should strip nav
         assert "Home" not in text or "About Our Company" in text  # content present
+
+
+class TestCompanyScraperInit:
+    def test_instantiates_with_defaults(self):
+        s = CompanyScraper()
+        assert s.max_subpages == 8
+        assert s.retry_mode == "full"
+        assert s.js_fallback is True
+        s.close()
+
+    def test_persist_raw_html_without_delta_path_raises(self):
+        with pytest.raises(ValueError, match="output_delta_path"):
+            CompanyScraper(persist_raw_html=True)
+
+    def test_delta_path_without_spark_raises(self):
+        with pytest.raises(RuntimeError, match="Spark"):
+            CompanyScraper(output_delta_path="/tmp/results")
+
+    def test_context_manager_closes_cleanly(self):
+        with CompanyScraper(js_fallback=False) as s:
+            assert s is not None
+        # no exception = close() was called
+
+    def test_custom_keyword_lists(self):
+        s = CompanyScraper(
+            high_value_keywords=["technology"],
+            low_value_keywords=["blog"],
+        )
+        assert s.high_value_keywords == ["technology"]
+        assert s.low_value_keywords == ["blog"]
+        s.close()
+
+    def test_default_keyword_lists_set(self):
+        s = CompanyScraper()
+        assert "about" in s.high_value_keywords
+        assert "careers" in s.low_value_keywords
+        s.close()
