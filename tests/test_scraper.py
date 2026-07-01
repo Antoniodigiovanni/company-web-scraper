@@ -359,6 +359,108 @@ class TestFetchWithPlaywright:
             scraper_mod.sync_playwright = original
 
 
+_STATIC_HOMEPAGE = """<html><head><title>Acme Corp</title></head><body>
+  <p>We build great software for businesses worldwide.</p>
+  <a href="/about">About</a>
+  <a href="/products">Products</a>
+  <a href="/careers">Careers</a>
+</body></html>"""
+
+_ABOUT_HTML = """<html><body>
+  <article>
+    <h1>About Acme</h1>
+    <p>Acme Corp was founded in 2005 and serves enterprise clients globally.
+    Our mission is to build reliable, scalable software solutions.</p>
+  </article>
+</body></html>"""
+
+
+def _make_response(status: int = 200, text: str = "") -> MagicMock:
+    r = MagicMock()
+    r.status_code = status
+    r.text = text
+    return r
+
+
+class TestDiscoverSubpages:
+    @patch("scraper.cffi_requests.Session")
+    def test_discovers_from_homepage_anchors(self, MockSession):
+        MockSession.return_value.get.return_value = _make_response(404)  # no sitemap
+        with CompanyScraper(js_fallback=False) as s:
+            urls = s._discover_subpages("https://example.com", _STATIC_HOMEPAGE)
+        assert any("about" in u for u in urls)
+        assert any("products" in u for u in urls)
+
+    @patch("scraper.cffi_requests.Session")
+    def test_discovers_from_sitemap_when_available(self, MockSession):
+        sitemap = """<?xml version="1.0"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com/about</loc></url>
+  <url><loc>https://example.com/technology</loc></url>
+</urlset>"""
+        MockSession.return_value.get.return_value = _make_response(200, sitemap)
+        with CompanyScraper(js_fallback=False) as s:
+            urls = s._discover_subpages("https://example.com", _STATIC_HOMEPAGE)
+        assert "https://example.com/about" in urls
+        assert "https://example.com/technology" in urls
+
+
+class TestScrapeCompany:
+    @patch("scraper.cffi_requests.Session")
+    def test_returns_ok_status_on_success(self, MockSession):
+        responses = {
+            "https://example.com": _make_response(200, _STATIC_HOMEPAGE),
+            "https://example.com/about": _make_response(200, _ABOUT_HTML),
+        }
+        def fake_get(url, **kwargs):
+            # sitemap and robots return 404
+            for key, resp in responses.items():
+                if url == key:
+                    return resp
+            return _make_response(404)
+
+        MockSession.return_value.get.side_effect = fake_get
+
+        with CompanyScraper(js_fallback=False, max_subpages=2) as s:
+            result = s._scrape_company("company_1", "https://example.com")
+
+        assert result["status"] in ("ok", "partial")
+        assert "company_1" == result["id"]
+        assert "example.com" in result["url"]
+        assert len(result["combined_text"]) > 0
+        assert "[Page name: home]" in result["combined_text"]
+
+    @patch("scraper.cffi_requests.Session")
+    def test_returns_failed_when_all_pages_blocked(self, MockSession):
+        MockSession.return_value.get.return_value = _make_response(403)
+        with CompanyScraper(js_fallback=False, max_subpages=2) as s:
+            result = s._scrape_company("company_2", "https://blocked.com")
+        assert result["status"] == "failed"
+        assert result["combined_text"] == ""
+
+    @patch("scraper.cffi_requests.Session")
+    def test_combined_text_format(self, MockSession):
+        def fake_get(url, **kwargs):
+            if "sitemap" in url or "robots" in url:
+                return _make_response(404)
+            if url == "https://example.com":
+                return _make_response(200, _STATIC_HOMEPAGE)
+            if "about" in url:
+                return _make_response(200, _ABOUT_HTML)
+            return _make_response(404)
+
+        MockSession.return_value.get.side_effect = fake_get
+
+        with CompanyScraper(js_fallback=False, max_subpages=3) as s:
+            result = s._scrape_company("c1", "https://example.com")
+
+        text = result["combined_text"]
+        assert text.startswith("[Page name: home]")
+        # Each page block starts with [Page name: <slug>]
+        import re
+        assert re.search(r"\[Page name: \S+\]", text)
+
+
 class TestCompanyScraperInit:
     def test_instantiates_with_defaults(self):
         s = CompanyScraper()

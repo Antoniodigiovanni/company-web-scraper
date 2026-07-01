@@ -311,6 +311,238 @@ class CompanyScraper:
     def __del__(self):
         self.close()
 
+    def _discover_subpages(self, base_url: str, homepage_html: str) -> list[str]:
+        """Return candidate subpage URLs (filtered, not yet ranked or capped)."""
+        parsed = urlparse(base_url)
+        base_host = parsed.netloc.removeprefix("www.")
+        all_urls: list[str] = []
+
+        # 1. Try sitemap.xml
+        sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
+        try:
+            session = cffi_requests.Session(impersonate=self.impersonate_profiles[0])
+            resp = session.get(sitemap_url, timeout=self.timeout_s)
+            if resp.status_code == 200 and resp.text.strip().startswith("<"):
+                if _is_sitemap_index(resp.text):
+                    child_urls = _parse_sitemap(resp.text)[:3]
+                    for child_url in child_urls:
+                        try:
+                            child_resp = session.get(child_url, timeout=self.timeout_s)
+                            if child_resp.status_code == 200:
+                                all_urls.extend(_parse_sitemap(child_resp.text))
+                        except Exception:
+                            pass
+                else:
+                    all_urls.extend(_parse_sitemap(resp.text))
+        except Exception:
+            pass
+
+        # 2. Try robots.txt for Sitemap: directives
+        if not all_urls:
+            robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+            try:
+                session = cffi_requests.Session(impersonate=self.impersonate_profiles[0])
+                resp = session.get(robots_url, timeout=self.timeout_s)
+                if resp.status_code == 200:
+                    for line in resp.text.splitlines():
+                        if line.lower().startswith("sitemap:"):
+                            sm_url = line.split(":", 1)[1].strip()
+                            try:
+                                sm_resp = session.get(sm_url, timeout=self.timeout_s)
+                                if sm_resp.status_code == 200:
+                                    all_urls.extend(_parse_sitemap(sm_resp.text))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        # 3. Fall back to anchor parsing
+        if not all_urls:
+            all_urls = _parse_anchor_links(homepage_html, base_url)
+
+        # Cap sitemap results and filter
+        return _filter_urls(all_urls[:200], base_host)
+
+    def _scrape_company(self, row_id, url: str) -> dict:
+        """Scrape one company. Returns a result dict matching the output DataFrame schema."""
+        t_start = time.time()
+        url = _normalize_url(url)
+        pages_meta: list[dict] = []
+        log_error: str | None = None
+        total_retries = 0
+        escalated_any = False
+
+        # --- Fetch homepage ---
+        start_idx = random.randint(0, len(self.impersonate_profiles) - 1)
+        hp_status, hp_html, hp_retries = _fetch_with_retry(
+            url, self.retry_mode, self.impersonate_profiles, self.timeout_s, start_idx
+        )
+        total_retries += hp_retries
+        hp_escalated = False
+
+        if hp_status in _BLOCKING_STATUSES or hp_status == 0:
+            if self.js_fallback:
+                hp_html = self._fetch_with_playwright(url)
+                hp_escalated = True
+                escalated_any = True
+
+        hp_text = _extract_text(hp_html)
+
+        if (not hp_text or len(hp_text) < _MIN_TEXT_LEN) and self.js_fallback and not hp_escalated:
+            hp_html = self._fetch_with_playwright(url)
+            hp_escalated = True
+            escalated_any = True
+            hp_text = _extract_text(hp_html)
+
+        # Hard-block detection after Playwright
+        if hp_escalated and hp_text:
+            lower = hp_text.lower()
+            if len(hp_text) < _MIN_TEXT_LEN or any(p in lower for p in _HARD_BLOCK_PATTERNS):
+                hp_text = ""
+
+        hp_fetched_at = datetime.now(timezone.utc)
+        pages_meta.append({
+            "url": url,
+            "page_name": "home",
+            "status": hp_status,
+            "text": hp_text,
+            "text_len": len(hp_text),
+            "escalated_to_js": hp_escalated,
+            "html": hp_html if self.persist_raw_html else "",
+            "fetched_at": hp_fetched_at,
+        })
+
+        if not hp_text:
+            log_error = f"Homepage blocked or empty: HTTP {hp_status}"
+
+        # --- Discover & rank subpages ---
+        candidate_urls = self._discover_subpages(url, hp_html)
+
+        if not candidate_urls and self.js_fallback and not hp_escalated:
+            # SPA: escalate homepage to get links
+            hp_html = self._fetch_with_playwright(url)
+            hp_escalated = True
+            escalated_any = True
+            pages_meta[0]["escalated_to_js"] = True
+            pages_meta[0]["html"] = hp_html if self.persist_raw_html else ""
+            candidate_urls = _parse_anchor_links(hp_html, url)
+            parsed = urlparse(url)
+            candidate_urls = _filter_urls(candidate_urls, parsed.netloc.removeprefix("www."))
+
+        # Exclude homepage itself
+        candidate_urls = [u for u in candidate_urls if _normalize_url(u) != url]
+        ranked = _rank_and_pick(
+            candidate_urls,
+            self.high_value_keywords,
+            self.low_value_keywords,
+            max_count=self.max_subpages - 1,
+        )
+
+        # --- Fetch subpages in parallel ---
+        def fetch_subpage(subpage_url: str) -> dict:
+            s_idx = random.randint(0, len(self.impersonate_profiles) - 1)
+            status, html, retries = _fetch_with_retry(
+                subpage_url, self.retry_mode, self.impersonate_profiles, self.timeout_s, s_idx
+            )
+            escalated = False
+            if status in _BLOCKING_STATUSES or status == 0:
+                if self.js_fallback:
+                    html = self._fetch_with_playwright(subpage_url)
+                    escalated = True
+            text = _extract_text(html)
+            if (not text or len(text) < _MIN_TEXT_LEN) and self.js_fallback and not escalated:
+                html = self._fetch_with_playwright(subpage_url)
+                escalated = True
+                text = _extract_text(html)
+            if escalated and text:
+                lower = text.lower()
+                if len(text) < _MIN_TEXT_LEN or any(p in lower for p in _HARD_BLOCK_PATTERNS):
+                    text = ""
+            return {
+                "url": subpage_url,
+                "page_name": _url_slug(subpage_url),
+                "status": status,
+                "text": text,
+                "text_len": len(text),
+                "escalated_to_js": escalated,
+                "html": html if self.persist_raw_html else "",
+                "fetched_at": datetime.now(timezone.utc),
+                "retries": retries,
+            }
+
+        if ranked:
+            with ThreadPoolExecutor(max_workers=self.subpage_workers) as pool:
+                futures = {pool.submit(fetch_subpage, u): u for u in ranked}
+                for fut in as_completed(futures):
+                    try:
+                        page = fut.result()
+                        pages_meta.append(page)
+                        total_retries += page.get("retries", 0)
+                        if page["escalated_to_js"]:
+                            escalated_any = True
+                        if not log_error and not page["text"]:
+                            log_error = f"No content from {page['url']}"
+                    except Exception as e:
+                        log_error = log_error or str(e)
+
+        # --- Combine text ---
+        ordered = [pages_meta[0]] + sorted(
+            pages_meta[1:],
+            key=lambda p: -_score_url(
+                urlparse(p["url"]).path,
+                self.high_value_keywords,
+                self.low_value_keywords,
+            ),
+        )
+        parts = []
+        for page in ordered:
+            if page["text"]:
+                parts.append(f"[Page name: {page['page_name']}]\n{page['text']}")
+        combined_text = "\n\n".join(parts)
+
+        num_ok = sum(1 for p in pages_meta if p["text"])
+        if num_ok == 0:
+            status_str = "failed"
+        elif num_ok < len(pages_meta):
+            status_str = "partial"
+        else:
+            status_str = "ok"
+
+        return {
+            "id": row_id,
+            "url": url,
+            "combined_text": combined_text,
+            "num_pages_tried": len(pages_meta),
+            "num_pages_ok": num_ok,
+            "pages": [
+                {
+                    "url": p["url"],
+                    "page_name": p["page_name"],
+                    "status": p["status"],
+                    "text_len": p["text_len"],
+                    "escalated_to_js": p["escalated_to_js"],
+                }
+                for p in pages_meta
+            ],
+            "escalated_to_js": escalated_any,
+            "retries_used": total_retries,
+            "status": status_str,
+            "error": log_error,
+            "total_time_s": time.time() - t_start,
+            "ts": datetime.now(timezone.utc),
+            "_raw_rows": [
+                {
+                    "id": row_id,
+                    "url": url,
+                    "page_url": p["url"],
+                    "html": p["html"],
+                    "fetched_at": p["fetched_at"],
+                    "escalated_to_js": p["escalated_to_js"],
+                }
+                for p in pages_meta
+            ] if self.persist_raw_html else [],
+        }
+
     def _fetch_with_playwright(self, url: str) -> str:
         global sync_playwright
         if sync_playwright is None:
