@@ -675,3 +675,25 @@ class CompanyScraper:
                 page.close()
             except Exception:
                 pass
+
+
+if __name__ == "__main__":
+    import sys
+
+    test_sites = [
+        ("static_1", "https://example.com"),          # plain static site
+        ("spa_1", "https://vercel.com"),               # Next.js SPA
+    ]
+
+    df = pd.DataFrame(test_sites, columns=["id", "url"])
+    scraper = CompanyScraper(max_subpages=3, retry_mode="minimal", js_fallback=True)
+    results = scraper.scrape(df, id_col="id", url_col="url")
+    scraper.close()
+
+    for _, row in results.iterrows():
+        print(f"\n{'='*60}")
+        print(f"ID: {row['id']} | URL: {row['url']}")
+        print(f"Status: {row['status']} | Pages: {row['num_pages_ok']}/{row['num_pages_tried']} | JS: {row['escalated_to_js']}")
+        print(f"Text preview: {row['combined_text'][:300]!r}")
+        if row["error"]:
+            print(f"Error: {row['error']}", file=sys.stderr)
