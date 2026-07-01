@@ -308,6 +308,57 @@ class TestExtractText:
         assert "Home" not in text or "About Our Company" in text  # content present
 
 
+class TestFetchWithPlaywright:
+    def _make_scraper(self):
+        return CompanyScraper(js_fallback=True)
+
+    @patch("scraper.sync_playwright")
+    def test_returns_html_on_success(self, mock_sync_playwright):
+        mock_page = MagicMock()
+        mock_page.content.return_value = "<html><body>Company info here</body></html>"
+        mock_page.query_selector.return_value = None  # no consent button
+
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = mock_page
+
+        mock_pw = MagicMock()
+        mock_pw.chromium.launch.return_value = mock_browser
+        mock_sync_playwright.return_value.__enter__.return_value = mock_pw
+
+        with CompanyScraper(js_fallback=True) as s:
+            html = s._fetch_with_playwright("https://example.com")
+
+        assert "<body>" in html
+
+    @patch("scraper.sync_playwright")
+    def test_returns_empty_on_timeout(self, mock_sync_playwright):
+        mock_page = MagicMock()
+        mock_page.goto.side_effect = Exception("Timeout 20000ms exceeded")
+
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = mock_page
+
+        mock_pw = MagicMock()
+        mock_pw.chromium.launch.return_value = mock_browser
+        mock_sync_playwright.return_value.__enter__.return_value = mock_pw
+
+        with CompanyScraper(js_fallback=True) as s:
+            html = s._fetch_with_playwright("https://example.com")
+
+        assert html == ""
+
+    def test_raises_import_error_when_playwright_not_installed(self):
+        import scraper as scraper_mod
+        original = scraper_mod.sync_playwright
+        scraper_mod.sync_playwright = None
+        try:
+            with CompanyScraper(js_fallback=True) as s:
+                with pytest.raises(ImportError, match="playwright install chromium"):
+                    s._fetch_with_playwright("https://example.com")
+        finally:
+            scraper_mod.sync_playwright = original
+
+
 class TestCompanyScraperInit:
     def test_instantiates_with_defaults(self):
         s = CompanyScraper()

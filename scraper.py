@@ -310,3 +310,47 @@ class CompanyScraper:
 
     def __del__(self):
         self.close()
+
+    def _fetch_with_playwright(self, url: str) -> str:
+        global sync_playwright
+        if sync_playwright is None:
+            raise ImportError(
+                "Playwright is not installed. Run: pip install playwright && playwright install chromium"
+            )
+
+        if self._playwright_ctx is None:
+            self._playwright_ctx = sync_playwright().__enter__()
+            self._browser = self._playwright_ctx.chromium.launch(headless=True)
+
+        page = self._browser.new_page()
+        try:
+            page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "media", "font")
+                else route.continue_(),
+            )
+            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            time.sleep(1.5)
+
+            for selector in _CONSENT_SELECTORS:
+                try:
+                    el = page.query_selector(selector)
+                    if el:
+                        el.click(timeout=2_000)
+                        break
+                except Exception:
+                    continue
+
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(0.5)
+
+            html = page.content()
+            return html
+        except Exception:
+            return ""
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
