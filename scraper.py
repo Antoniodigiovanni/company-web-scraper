@@ -543,6 +543,45 @@ class CompanyScraper:
             ] if self.persist_raw_html else [],
         }
 
+    def scrape(
+        self,
+        df: pd.DataFrame,
+        id_col: str,
+        url_col: str,
+    ) -> pd.DataFrame:
+        results = []
+        log_rows = []
+        raw_rows = []
+
+        for _, row in df.iterrows():
+            row_id = row[id_col]
+            url = str(row[url_col])
+            result = self._scrape_company(row_id, url)
+
+            raw = result.pop("_raw_rows", [])
+            raw_rows.extend(raw)
+
+            log_rows.append({
+                "id": row_id,
+                "url": result["url"],
+                "ts": result["ts"],
+                "status": result["status"],
+                "subpages_tried": result["num_pages_tried"],
+                "subpages_ok": result["num_pages_ok"],
+                "escalated_to_js": result["escalated_to_js"],
+                "retries_used": result["retries_used"],
+                "total_time_s": result["total_time_s"],
+                "error": result["error"],
+            })
+            results.append(result)
+
+        result_df = pd.DataFrame(results)
+
+        if self.output_delta_path or self.delta_log_path:
+            self._write_delta(result_df, log_rows, raw_rows)
+
+        return result_df
+
     def _fetch_with_playwright(self, url: str) -> str:
         global sync_playwright
         if sync_playwright is None:

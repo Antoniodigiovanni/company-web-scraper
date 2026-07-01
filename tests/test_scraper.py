@@ -1,6 +1,8 @@
 import pytest
 from unittest.mock import MagicMock, call, patch
 
+import pandas as pd
+
 import scraper  # noqa: F401
 from scraper import (
     _filter_urls, _fetch_with_retry, _is_sitemap_index, _normalize_url,
@@ -496,3 +498,48 @@ class TestCompanyScraperInit:
         assert "about" in s.high_value_keywords
         assert "careers" in s.low_value_keywords
         s.close()
+
+
+class TestScrapeMethod:
+    @patch("scraper.cffi_requests.Session")
+    def test_returns_dataframe_with_expected_columns(self, MockSession):
+        MockSession.return_value.get.side_effect = lambda url, **kw: _make_response(
+            200, _STATIC_HOMEPAGE if "sitemap" not in url and "robots" not in url else ""
+        ) if "sitemap" not in url and "robots" not in url else _make_response(404)
+
+        # Simpler: return static homepage for company URL, 404 for everything else
+        def fake_get(url, **kw):
+            if url == "https://example.com":
+                return _make_response(200, _STATIC_HOMEPAGE)
+            return _make_response(404)
+
+        MockSession.return_value.get.side_effect = fake_get
+
+        df = pd.DataFrame([{"cid": "A1", "website": "https://example.com"}])
+        with CompanyScraper(js_fallback=False, max_subpages=1) as s:
+            result = s.scrape(df, id_col="cid", url_col="website")
+
+        assert isinstance(result, pd.DataFrame)
+        for col in ["id", "url", "combined_text", "num_pages_tried", "num_pages_ok",
+                    "pages", "escalated_to_js", "retries_used", "status", "error",
+                    "total_time_s", "ts"]:
+            assert col in result.columns, f"Missing column: {col}"
+
+    @patch("scraper.cffi_requests.Session")
+    def test_one_row_per_input_company(self, MockSession):
+        MockSession.return_value.get.return_value = _make_response(404)
+        df = pd.DataFrame([
+            {"id": "C1", "url": "https://a.com"},
+            {"id": "C2", "url": "https://b.com"},
+        ])
+        with CompanyScraper(js_fallback=False, max_subpages=1) as s:
+            result = s.scrape(df, id_col="id", url_col="url")
+        assert len(result) == 2
+
+    @patch("scraper.cffi_requests.Session")
+    def test_id_column_preserved(self, MockSession):
+        MockSession.return_value.get.return_value = _make_response(404)
+        df = pd.DataFrame([{"company_id": 42, "site": "https://x.com"}])
+        with CompanyScraper(js_fallback=False, max_subpages=1) as s:
+            result = s.scrape(df, id_col="company_id", url_col="site")
+        assert result.iloc[0]["id"] == 42
