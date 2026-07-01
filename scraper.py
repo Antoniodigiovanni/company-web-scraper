@@ -120,3 +120,26 @@ def _filter_urls(urls: list[str], base_host: str) -> list[str]:
             seen.add(url)
             result.append(url)
     return result
+
+
+def _score_url(path: str, high_kw: list[str], low_kw: list[str]) -> int:
+    """Scores a URL path based on keyword matching. High keywords return +2, low return -1, else 0. High wins over low."""
+    lower = path.lower()
+    if any(kw in lower for kw in high_kw):
+        return 2
+    if any(kw in lower for kw in low_kw):
+        return -1
+    return 0
+
+
+def _rank_and_pick(
+    urls: list[str], high_kw: list[str], low_kw: list[str], max_count: int
+) -> list[str]:
+    """Ranks URLs by score (descending) then by path depth (ascending), returns top max_count URLs."""
+    def sort_key(url: str):
+        path = urlparse(url).path
+        score = _score_url(path, high_kw, low_kw)
+        depth = path.count("/")
+        return (-score, depth)  # higher score first, shallower path first
+
+    return sorted(urls, key=sort_key)[:max_count]

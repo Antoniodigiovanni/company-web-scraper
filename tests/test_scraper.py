@@ -1,7 +1,7 @@
 import scraper  # noqa: F401
 from scraper import (
     _filter_urls, _is_sitemap_index, _normalize_url, _parse_anchor_links,
-    _parse_sitemap, _url_slug,
+    _parse_sitemap, _url_slug, _score_url, _rank_and_pick,
 )
 
 
@@ -142,3 +142,60 @@ class TestFilterUrls:
         urls = ["ftp://example.com/file", "https://example.com/about"]
         result = _filter_urls(urls, "example.com")
         assert not any(u.startswith("ftp") for u in result)
+
+
+_HIGH = ["about", "products", "services"]
+_LOW = ["careers", "blog"]
+
+
+class TestScoreUrl:
+    def test_high_value_match(self):
+        assert _score_url("/about-us", _HIGH, _LOW) == 2
+
+    def test_high_value_exact(self):
+        assert _score_url("/products", _HIGH, _LOW) == 2
+
+    def test_low_value_match(self):
+        assert _score_url("/careers", _HIGH, _LOW) == -1
+
+    def test_neutral(self):
+        assert _score_url("/pricing", _HIGH, _LOW) == 0
+
+    def test_case_insensitive(self):
+        assert _score_url("/About-Us", _HIGH, _LOW) == 2
+
+    def test_high_beats_low_when_both_match(self):
+        # If a URL somehow contains both a high and low keyword, high wins (+2 takes priority)
+        assert _score_url("/products-blog", _HIGH, _LOW) == 2
+
+
+class TestRankAndPick:
+    _URLS = [
+        "https://x.com/careers",
+        "https://x.com/about",
+        "https://x.com/products",
+        "https://x.com/pricing",
+        "https://x.com/blog",
+    ]
+
+    def test_picks_high_value_first(self):
+        ranked = _rank_and_pick(self._URLS, _HIGH, _LOW, max_count=2)
+        assert "https://x.com/about" in ranked or "https://x.com/products" in ranked
+
+    def test_respects_max_count(self):
+        ranked = _rank_and_pick(self._URLS, _HIGH, _LOW, max_count=3)
+        assert len(ranked) == 3
+
+    def test_excludes_low_value_when_enough_high(self):
+        ranked = _rank_and_pick(self._URLS, _HIGH, _LOW, max_count=2)
+        assert "https://x.com/careers" not in ranked
+        assert "https://x.com/blog" not in ranked
+
+    def test_returns_all_when_fewer_than_max(self):
+        ranked = _rank_and_pick(["https://x.com/about"], _HIGH, _LOW, max_count=5)
+        assert len(ranked) == 1
+
+    def test_prefers_shallower_paths_among_equal_scores(self):
+        urls = ["https://x.com/en/about/team", "https://x.com/about"]
+        ranked = _rank_and_pick(urls, _HIGH, _LOW, max_count=1)
+        assert ranked[0] == "https://x.com/about"
