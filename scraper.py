@@ -143,3 +143,62 @@ def _rank_and_pick(
         return (-score, depth)  # higher score first, shallower path first
 
     return sorted(urls, key=sort_key)[:max_count]
+
+
+def _fetch_with_retry(
+    url: str,
+    retry_mode: str,
+    profiles: tuple,
+    timeout_s: float,
+    start_profile_idx: int = 0,
+) -> tuple[int, str, int]:
+    """Fetches a URL with configurable retry behaviour and browser impersonation rotation.
+
+    Returns (status_code, html_text, retries_used).
+    On network exception: (0, "", retries_used_so_far).
+    """
+    n = len(profiles)
+    i = start_profile_idx % n
+
+    # Build attempt schedule: each entry is (profile, pre_sleep_seconds)
+    if retry_mode == "none":
+        schedule = [(profiles[i], 0.0)]
+    elif retry_mode == "minimal":
+        schedule = [(profiles[i], 0.0), (profiles[(i + 1) % n], 0.0)]
+    else:  # "full"
+        schedule = [
+            (profiles[i], 0.0),
+            (profiles[i], 1.0),
+            (profiles[i], 2.0),
+            (profiles[(i + 1) % n], 4.0),
+            (profiles[(i + 2) % n], 8.0),
+        ]
+
+    last_status, last_html, retries_used = 0, "", 0
+
+    for attempt_idx, (profile, sleep_s) in enumerate(schedule):
+        if sleep_s > 0:
+            time.sleep(sleep_s + random.uniform(0, 0.5))
+
+        try:
+            session = cffi_requests.Session(impersonate=profile)
+            resp = session.get(url, timeout=timeout_s)
+            last_status = resp.status_code
+            last_html = resp.text
+        except Exception:
+            last_status = 0
+            last_html = ""
+            if attempt_idx < len(schedule) - 1:
+                retries_used += 1
+                continue
+
+        if last_status == 404:
+            break  # terminal — never retry
+
+        if last_status not in _BLOCKING_STATUSES and last_status != 0:
+            break  # success
+
+        if attempt_idx < len(schedule) - 1:
+            retries_used += 1
+
+    return last_status, last_html, retries_used

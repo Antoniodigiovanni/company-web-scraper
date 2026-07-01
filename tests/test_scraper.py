@@ -1,7 +1,9 @@
+from unittest.mock import MagicMock, call, patch
+
 import scraper  # noqa: F401
 from scraper import (
-    _filter_urls, _is_sitemap_index, _normalize_url, _parse_anchor_links,
-    _parse_sitemap, _url_slug, _score_url, _rank_and_pick,
+    _filter_urls, _fetch_with_retry, _is_sitemap_index, _normalize_url,
+    _parse_anchor_links, _parse_sitemap, _url_slug, _score_url, _rank_and_pick,
 )
 
 
@@ -199,3 +201,74 @@ class TestRankAndPick:
         urls = ["https://x.com/en/about/team", "https://x.com/about"]
         ranked = _rank_and_pick(urls, _HIGH, _LOW, max_count=1)
         assert ranked[0] == "https://x.com/about"
+
+
+def _mock_resp(status: int, text: str = "") -> MagicMock:
+    r = MagicMock()
+    r.status_code = status
+    r.text = text
+    return r
+
+
+class TestFetchWithRetry:
+    @patch("scraper.cffi_requests.Session")
+    def test_returns_200_on_success(self, MockSession):
+        MockSession.return_value.get.return_value = _mock_resp(200, "<html>ok</html>")
+        status, html, retries = _fetch_with_retry(
+            "https://x.com", "none", ("chrome124",), 15.0
+        )
+        assert status == 200
+        assert html == "<html>ok</html>"
+        assert retries == 0
+
+    @patch("scraper.cffi_requests.Session")
+    def test_none_mode_no_retry_on_403(self, MockSession):
+        MockSession.return_value.get.return_value = _mock_resp(403)
+        status, _, retries = _fetch_with_retry(
+            "https://x.com", "none", ("chrome124",), 15.0
+        )
+        assert status == 403
+        assert retries == 0
+        assert MockSession.return_value.get.call_count == 1
+
+    @patch("time.sleep")
+    @patch("scraper.cffi_requests.Session")
+    def test_minimal_mode_retries_once_on_403(self, MockSession, mock_sleep):
+        MockSession.return_value.get.side_effect = [_mock_resp(403), _mock_resp(200, "<html/>")]
+        status, _, retries = _fetch_with_retry(
+            "https://x.com", "minimal", ("chrome124", "safari17_2"), 15.0
+        )
+        assert status == 200
+        assert retries == 1
+
+    @patch("time.sleep")
+    @patch("scraper.cffi_requests.Session")
+    def test_full_mode_terminates_on_404(self, MockSession, mock_sleep):
+        MockSession.return_value.get.return_value = _mock_resp(404)
+        status, _, retries = _fetch_with_retry(
+            "https://x.com", "full", ("chrome124", "safari17_2", "firefox133"), 15.0
+        )
+        assert status == 404
+        assert retries == 0
+        assert MockSession.return_value.get.call_count == 1
+
+    @patch("time.sleep")
+    @patch("scraper.cffi_requests.Session")
+    def test_full_mode_does_4_retries_before_giving_up(self, MockSession, mock_sleep):
+        MockSession.return_value.get.return_value = _mock_resp(403)
+        status, _, retries = _fetch_with_retry(
+            "https://x.com", "full", ("chrome124", "safari17_2", "firefox133"), 15.0
+        )
+        assert status == 403
+        assert retries == 4
+        assert MockSession.return_value.get.call_count == 5  # 1 initial + 4 retries
+
+    @patch("time.sleep")
+    @patch("scraper.cffi_requests.Session")
+    def test_network_error_returns_status_0(self, MockSession, mock_sleep):
+        MockSession.return_value.get.side_effect = Exception("connection refused")
+        status, html, retries = _fetch_with_retry(
+            "https://x.com", "none", ("chrome124",), 15.0
+        )
+        assert status == 0
+        assert html == ""
