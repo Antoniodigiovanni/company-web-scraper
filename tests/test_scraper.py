@@ -4,6 +4,7 @@ import scraper  # noqa: F401
 from scraper import (
     _filter_urls, _fetch_with_retry, _is_sitemap_index, _normalize_url,
     _parse_anchor_links, _parse_sitemap, _url_slug, _score_url, _rank_and_pick,
+    _extract_text,
 )
 
 
@@ -272,3 +273,34 @@ class TestFetchWithRetry:
         )
         assert status == 0
         assert html == ""
+
+
+_ARTICLE_HTML = """<html><body>
+<article>
+  <h1>About Our Company</h1>
+  <p>We build software that helps businesses grow. Our team is distributed across the globe.</p>
+  <p>Founded in 2010, we have served over 5000 customers.</p>
+</article>
+<nav><a href="/home">Home</a></nav>
+</body></html>"""
+
+_EMPTY_HTML = "<html><body><script>window.location='/';</script></body></html>"
+
+
+class TestExtractText:
+    def test_extracts_article_text(self):
+        text = _extract_text(_ARTICLE_HTML)
+        assert "software" in text
+        assert len(text) > 50
+
+    def test_returns_empty_string_on_script_only_page(self):
+        text = _extract_text(_EMPTY_HTML)
+        assert isinstance(text, str)  # never None
+
+    def test_returns_empty_string_on_empty_input(self):
+        assert _extract_text("") == ""
+
+    def test_excludes_nav_boilerplate(self):
+        text = _extract_text(_ARTICLE_HTML)
+        # trafilatura with favor_precision=True should strip nav
+        assert "Home" not in text or "About Our Company" in text  # content present

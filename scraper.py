@@ -202,3 +202,11 @@ def _fetch_with_retry(
             retries_used += 1
 
     return last_status, last_html, retries_used
+
+
+def _extract_text(html: str) -> str:
+    """Extracts prose text from HTML using trafilatura. Returns extracted text or ''."""
+    if not html:
+        return ""
+    result = trafilatura.extract(html, include_comments=False, favor_precision=True)
+    return result or ""
