@@ -44,3 +44,22 @@ _CONSENT_SELECTORS = [
     "#didomi-notice-agree-button",
     "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
 ]
+
+
+def _normalize_url(url: str) -> str:
+    """Ensures https:// scheme, strips fragment and trailing slash."""
+    if "://" not in url:
+        url = "https://" + url
+    parsed = urlparse(url)
+    # Drop fragment; strip trailing slash from path (but keep root as empty)
+    path = parsed.path.rstrip("/")
+    normalized = parsed._replace(fragment="", path=path)
+    return normalized.geturl()
+
+
+def _url_slug(url: str) -> str:
+    """Returns last non-empty path segment or 'home' for root."""
+    path = urlparse(url).path.rstrip("/")
+    if not path:
+        return "home"
+    return path.split("/")[-1] or "home"
