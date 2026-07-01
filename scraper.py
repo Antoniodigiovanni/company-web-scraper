@@ -45,6 +45,28 @@ _CONSENT_SELECTORS = [
     "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
 ]
 
+# Spark schema strings (used with spark.createDataFrame schema parameter)
+_RESULTS_SCHEMA = """
+    id string, url string, combined_text string,
+    num_pages_tried int, num_pages_ok int,
+    pages array<struct<url:string,page_name:string,status:int,text_len:int,escalated_to_js:boolean>>,
+    escalated_to_js boolean, retries_used int,
+    status string, error string,
+    total_time_s double, ts timestamp
+"""
+
+_LOG_SCHEMA = """
+    id string, url string, ts timestamp,
+    status string, subpages_tried int, subpages_ok int,
+    escalated_to_js boolean, retries_used int,
+    total_time_s double, error string
+"""
+
+_RAW_SCHEMA = """
+    id string, url string, page_url string,
+    html string, fetched_at timestamp, escalated_to_js boolean
+"""
+
 
 def _normalize_url(url: str) -> str:
     """Ensures https:// scheme, strips fragment and trailing slash."""
@@ -581,6 +603,34 @@ class CompanyScraper:
             self._write_delta(result_df, log_rows, raw_rows)
 
         return result_df
+
+    def _write_delta(
+        self,
+        result_df: pd.DataFrame,
+        log_rows: list[dict],
+        raw_rows: list[dict],
+    ) -> None:
+        def _spark_write(pdf: pd.DataFrame, path: str, schema: str) -> None:
+            sdf = self._spark.createDataFrame(pdf, schema=schema.strip())
+            for attempt in range(3):
+                try:
+                    sdf.write.format("delta").mode("append").save(path)
+                    return
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    time.sleep([1.0, 2.0, 4.0][attempt] + random.uniform(0, 0.5))
+
+        if self.output_delta_path:
+            _spark_write(result_df, self.output_delta_path, _RESULTS_SCHEMA)
+
+        if self.output_delta_path and self.persist_raw_html and raw_rows:
+            raw_df = pd.DataFrame(raw_rows)
+            _spark_write(raw_df, self.output_delta_path + "_raw", _RAW_SCHEMA)
+
+        if self.delta_log_path and log_rows:
+            log_df = pd.DataFrame(log_rows)
+            _spark_write(log_df, self.delta_log_path, _LOG_SCHEMA)
 
     def _fetch_with_playwright(self, url: str) -> str:
         global sync_playwright

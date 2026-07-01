@@ -1,5 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, call, patch
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -543,3 +544,70 @@ class TestScrapeMethod:
         with CompanyScraper(js_fallback=False, max_subpages=1) as s:
             result = s.scrape(df, id_col="company_id", url_col="site")
         assert result.iloc[0]["id"] == 42
+
+
+class TestWriteDelta:
+    def _make_result_df(self):
+        return pd.DataFrame([{
+            "id": "C1", "url": "https://example.com", "combined_text": "text",
+            "num_pages_tried": 1, "num_pages_ok": 1,
+            "pages": [{"url": "https://example.com", "page_name": "home",
+                       "status": 200, "text_len": 4, "escalated_to_js": False}],
+            "escalated_to_js": False, "retries_used": 0,
+            "status": "ok", "error": None,
+            "total_time_s": 1.0, "ts": datetime.now(timezone.utc),
+        }])
+
+    def _make_log_rows(self):
+        return [{"id": "C1", "url": "https://example.com", "ts": datetime.now(timezone.utc),
+                 "status": "ok", "subpages_tried": 1, "subpages_ok": 1,
+                 "escalated_to_js": False, "retries_used": 0, "total_time_s": 1.0, "error": None}]
+
+    @patch("scraper.cffi_requests.Session")
+    def test_write_delta_called_with_output_path(self, MockSession):
+        mock_spark = MagicMock()
+        mock_spark_df = MagicMock()
+        mock_spark.createDataFrame.return_value = mock_spark_df
+
+        MockSession.return_value.get.return_value = _make_response(404)
+
+        with CompanyScraper(
+            js_fallback=False, max_subpages=1,
+            output_delta_path="/tmp/results", spark=mock_spark,
+        ) as s:
+            df_in = pd.DataFrame([{"id": "C1", "url": "https://x.com"}])
+            s.scrape(df_in, id_col="id", url_col="url")
+
+        # Spark createDataFrame should have been called for results
+        assert mock_spark.createDataFrame.called
+        write_call = mock_spark_df.write.format.return_value.mode.return_value.save
+        assert write_call.called
+        save_args = write_call.call_args[0]
+        assert "/tmp/results" in save_args[0]
+
+    @patch("scraper.cffi_requests.Session")
+    def test_write_delta_retries_on_concurrent_exception(self, MockSession):
+        mock_spark = MagicMock()
+        mock_spark_df = MagicMock()
+        mock_spark.createDataFrame.return_value = mock_spark_df
+
+        # Simulate ConcurrentAppendException on first write, success on second
+        from unittest.mock import call as mock_call
+
+        call_count = {"n": 0}
+        def raise_then_succeed(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise Exception("ConcurrentAppendException")
+
+        mock_spark_df.write.format.return_value.mode.return_value.save.side_effect = raise_then_succeed
+        MockSession.return_value.get.return_value = _make_response(404)
+
+        with CompanyScraper(
+            js_fallback=False, max_subpages=1,
+            output_delta_path="/tmp/results", spark=mock_spark,
+        ) as s:
+            df_in = pd.DataFrame([{"id": "C1", "url": "https://x.com"}])
+            s.scrape(df_in, id_col="id", url_col="url")  # should not raise
+
+        assert call_count["n"] == 2  # retried once
