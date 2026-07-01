@@ -361,6 +361,46 @@ class TestFetchWithPlaywright:
         finally:
             scraper_mod.sync_playwright = original
 
+    def test_playwright_lazy_init_is_thread_safe(self):
+        """Concurrent calls must not double-initialise the browser."""
+        import threading as _threading
+
+        mock_pw = MagicMock()
+        mock_ctx = MagicMock()
+        mock_browser = MagicMock()
+        mock_page = MagicMock()
+        mock_pw.return_value.__enter__ = MagicMock(return_value=mock_ctx)
+        mock_ctx.chromium.launch.return_value = mock_browser
+        mock_browser.new_page.return_value = mock_page
+        mock_page.content.return_value = "<html><body>enough text here to pass the length check for sure yes definitely enough words</body></html>"
+
+        import scraper as scraper_mod
+        original = scraper_mod.sync_playwright
+        scraper_mod.sync_playwright = mock_pw
+        try:
+            s = CompanyScraper(js_fallback=True)
+            results = []
+            errors = []
+
+            def call_pw():
+                try:
+                    results.append(s._fetch_with_playwright("https://example.com"))
+                except Exception as e:
+                    errors.append(e)
+
+            threads = [_threading.Thread(target=call_pw) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            assert not errors, f"Threads raised: {errors}"
+            # Browser should have been launched exactly once
+            assert mock_ctx.chromium.launch.call_count == 1
+        finally:
+            scraper_mod.sync_playwright = original
+            s.close()
+
 
 _STATIC_HOMEPAGE = """<html><head><title>Acme Corp</title></head><body>
   <p>We build great software for businesses worldwide.</p>
@@ -611,3 +651,27 @@ class TestWriteDelta:
             s.scrape(df_in, id_col="id", url_col="url")  # should not raise
 
         assert call_count["n"] == 2  # retried once
+
+    @patch("scraper.cffi_requests.Session")
+    def test_write_delta_does_not_retry_non_concurrent_exception(self, MockSession):
+        mock_spark = MagicMock()
+        mock_spark_df = MagicMock()
+        mock_spark.createDataFrame.return_value = mock_spark_df
+
+        call_count = {"n": 0}
+        def always_raise(*args, **kwargs):
+            call_count["n"] += 1
+            raise Exception("some other spark error")
+
+        mock_spark_df.write.format.return_value.mode.return_value.save.side_effect = always_raise
+        MockSession.return_value.get.return_value = _make_response(404)
+
+        with CompanyScraper(
+            js_fallback=False, max_subpages=1,
+            output_delta_path="/tmp/results", spark=mock_spark,
+        ) as s:
+            df_in = pd.DataFrame([{"id": "C1", "url": "https://x.com"}])
+            with pytest.raises(Exception, match="some other spark error"):
+                s.scrape(df_in, id_col="id", url_col="url")
+
+        assert call_count["n"] == 1  # NOT retried

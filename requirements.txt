@@ -3,4 +3,3 @@ trafilatura>=1.12
 lxml
 pandas
 playwright
-pytest

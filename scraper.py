@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import random
+import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Literal
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import pandas as pd
 import trafilatura
@@ -309,6 +310,7 @@ class CompanyScraper:
 
         self._browser = None
         self._playwright_ctx = None
+        self._pw_lock = threading.Lock()
 
     def close(self) -> None:
         if getattr(self, "_browser", None) is not None:
@@ -617,7 +619,7 @@ class CompanyScraper:
                     sdf.write.format("delta").mode("append").save(path)
                     return
                 except Exception as e:
-                    if attempt == 2:
+                    if "ConcurrentAppendException" not in str(e) or attempt == 2:
                         raise
                     time.sleep([1.0, 2.0, 4.0][attempt] + random.uniform(0, 0.5))
 
@@ -633,48 +635,48 @@ class CompanyScraper:
             _spark_write(log_df, self.delta_log_path, _LOG_SCHEMA)
 
     def _fetch_with_playwright(self, url: str) -> str:
-        global sync_playwright
         if sync_playwright is None:
             raise ImportError(
                 "Playwright is not installed. Run: pip install playwright && playwright install chromium"
             )
 
-        if self._playwright_ctx is None:
-            self._playwright_ctx = sync_playwright().__enter__()
-            self._browser = self._playwright_ctx.chromium.launch(headless=True)
+        with self._pw_lock:
+            if self._playwright_ctx is None:
+                self._playwright_ctx = sync_playwright().__enter__()
+                self._browser = self._playwright_ctx.chromium.launch(headless=True)
 
-        page = self._browser.new_page()
-        try:
-            page.route(
-                "**/*",
-                lambda route: route.abort()
-                if route.request.resource_type in ("image", "media", "font")
-                else route.continue_(),
-            )
-            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            time.sleep(1.5)
-
-            for selector in _CONSENT_SELECTORS:
-                try:
-                    el = page.query_selector(selector)
-                    if el:
-                        el.click(timeout=2_000)
-                        break
-                except Exception:
-                    continue
-
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(0.5)
-
-            html = page.content()
-            return html
-        except Exception:
-            return ""
-        finally:
+            page = self._browser.new_page()
             try:
-                page.close()
+                page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in ("image", "media", "font")
+                    else route.continue_(),
+                )
+                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+                time.sleep(1.5)
+
+                for selector in _CONSENT_SELECTORS:
+                    try:
+                        el = page.query_selector(selector)
+                        if el:
+                            el.click(timeout=2_000)
+                            break
+                    except Exception:
+                        continue
+
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(0.5)
+
+                html = page.content()
+                return html
             except Exception:
-                pass
+                return ""
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
