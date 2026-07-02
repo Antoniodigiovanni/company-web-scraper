@@ -1,0 +1,5 @@
+curl_cffi>=0.7
+trafilatura>=1.12
+lxml
+pandas
+playwright
