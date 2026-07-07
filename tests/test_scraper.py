@@ -706,6 +706,28 @@ class TestWriteDelta:
         assert "/tmp/results" in save_args[0]
 
     @patch("scraper.cffi_requests.Session")
+    def test_write_delta_uses_saveAsTable_for_unity_catalog_table_name(self, MockSession):
+        """A target with no '/' is a catalog.schema.table name, not a path, and must use saveAsTable."""
+        mock_spark = MagicMock()
+        mock_spark_df = MagicMock()
+        mock_spark.createDataFrame.return_value = mock_spark_df
+
+        MockSession.return_value.get.return_value = _make_response(404)
+
+        with CompanyScraper(
+            js_fallback=False, max_subpages=1,
+            output_delta_path="cbdm_uat_peer_model_tmp.example_scraper", spark=mock_spark,
+        ) as s:
+            df_in = pd.DataFrame([{"id": "C1", "url": "https://x.com"}])
+            s.scrape(df_in, id_col="id", url_col="url")
+
+        save_as_table_call = mock_spark_df.write.format.return_value.mode.return_value.saveAsTable
+        assert save_as_table_call.called
+        assert save_as_table_call.call_args[0][0] == "cbdm_uat_peer_model_tmp.example_scraper"
+        # Must never fall back to path-based save() for a table name.
+        assert not mock_spark_df.write.format.return_value.mode.return_value.save.called
+
+    @patch("scraper.cffi_requests.Session")
     def test_write_delta_retries_on_concurrent_exception(self, MockSession):
         mock_spark = MagicMock()
         mock_spark_df = MagicMock()

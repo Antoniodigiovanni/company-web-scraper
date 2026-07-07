@@ -296,10 +296,13 @@ class CompanyScraper:
         timeout_s: Per-request timeout in seconds.
         subpage_workers: ThreadPoolExecutor workers for parallel subpage fetching.
         js_fallback: If True, escalate blocked/empty pages to Playwright.
-        output_delta_path: If set, append results DataFrame to this Delta table.
-        delta_log_path: If set, append per-company log rows to this Delta table.
-        persist_raw_html: If True, write raw HTML to {output_delta_path}_raw Delta table.
-            Requires output_delta_path.
+        output_delta_path: If set, append results DataFrame to this Delta target — either a
+            path (dbfs:/..., /Volumes/..., s3://...) or a Unity Catalog table name
+            (catalog.schema.table / schema.table). Table names never contain '/'.
+        delta_log_path: If set, append per-company log rows to this Delta target (path or
+            Unity Catalog table name, same rules as output_delta_path).
+        persist_raw_html: If True, write raw HTML to a second Delta target derived from
+            output_delta_path (path + "_raw", or table name + "_raw"). Requires output_delta_path.
         spark: SparkSession to use. If None, uses SparkSession.getActiveSession().
     """
 
@@ -677,13 +680,23 @@ class CompanyScraper:
         log_rows: list[dict],
         raw_rows: list[dict],
     ) -> None:
-        """Writes the results/log/raw-html DataFrames to their configured Delta table paths."""
-        def _spark_write(pdf: pd.DataFrame, path: str, schema: str) -> None:
-            """Appends pdf to path as Delta under schema, retrying up to 3 times on concurrent-append conflicts."""
+        """Writes the results/log/raw-html DataFrames to their configured Delta targets."""
+        def _spark_write(pdf: pd.DataFrame, target: str, schema: str) -> None:
+            """Appends pdf as Delta under schema to target, retrying up to 3 times on concurrent-append conflicts.
+
+            target is a filesystem/Delta path (e.g. dbfs:/..., /Volumes/..., s3://...) if it
+            contains '/', otherwise it's treated as a Unity Catalog table name (catalog.schema.table
+            or schema.table) and written with saveAsTable instead of save.
+            """
             sdf = self._spark.createDataFrame(pdf, schema=schema.strip())
+            is_table_name = "/" not in target
             for attempt in range(3):
                 try:
-                    sdf.write.format("delta").mode("append").save(path)
+                    writer = sdf.write.format("delta").mode("append")
+                    if is_table_name:
+                        writer.saveAsTable(target)
+                    else:
+                        writer.save(target)
                     return
                 except Exception as e:
                     if "ConcurrentAppendException" not in str(e) or attempt == 2:

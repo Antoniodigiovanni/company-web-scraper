@@ -85,8 +85,8 @@ CompanyScraper(
     timeout_s=15.0,
     subpage_workers=5,
     js_fallback=True,
-    output_delta_path=None,       # Delta table path for results
-    delta_log_path=None,          # Delta table path for per-scrape logs
+    output_delta_path=None,       # Delta path or Unity Catalog table name for results
+    delta_log_path=None,          # Delta path or Unity Catalog table name for per-scrape logs
     persist_raw_html=False,       # requires output_delta_path
     spark=None,                   # SparkSession; auto-detected on Databricks
 )
@@ -158,6 +158,21 @@ Set to `False` to disable Playwright entirely (useful in environments where Chro
 ### `persist_raw_html` (default: `False`)
 
 When `True`, raw HTML for every fetched page is written to a separate Delta table at `{output_delta_path}_raw`. Requires `output_delta_path` to be set.
+
+### `output_delta_path` / `delta_log_path`: path vs. Unity Catalog table name
+
+Both accept either form, detected automatically — a value containing `/` is treated as a filesystem/Delta path and written with `.save()`; a value with no `/` is treated as a Unity Catalog table name (`catalog.schema.table` or `schema.table`) and written with `.saveAsTable()`.
+
+```python
+# Path-based (DBFS, Volumes, cloud storage)
+CompanyScraper(output_delta_path="dbfs:/mnt/data/scrape_results")
+CompanyScraper(output_delta_path="/Volumes/my_catalog/my_schema/my_volume/scrape_results")
+
+# Unity Catalog managed table
+CompanyScraper(output_delta_path="my_catalog.my_schema.scrape_results")
+```
+
+Passing a table name to a path-only API (or vice versa) is the cause of Spark errors like `Path must be absolute: my_catalog.my_schema/_delta_log` — that message means a table name was handed to a path-based writer.
 
 ---
 
