@@ -652,6 +652,7 @@ class CompanyScraper:
 
             raw = result.pop("_raw_rows", [])
             raw_rows.extend(raw)
+            print(f"[{row_id}] status={result['status']} raw_pages_collected={len(raw)}")  # DEBUG
 
             log_rows.append({
                 "id": row_id,
@@ -690,6 +691,7 @@ class CompanyScraper:
             """
             sdf = self._spark.createDataFrame(pdf, schema=schema.strip())
             is_table_name = "/" not in target
+            print(f"writing {len(pdf)} rows to target={target!r} (is_table_name={is_table_name})")  # DEBUG
             for attempt in range(3):
                 try:
                     writer = sdf.write.format("delta").mode("append")
@@ -697,6 +699,7 @@ class CompanyScraper:
                         writer.saveAsTable(target)
                     else:
                         writer.save(target)
+                    print(f"write succeeded: {target!r}")  # DEBUG
                     return
                 except Exception as e:
                     if "ConcurrentAppendException" not in str(e) or attempt == 2:
@@ -706,6 +709,7 @@ class CompanyScraper:
         if self.output_delta_path:
             _spark_write(result_df, self.output_delta_path, _RESULTS_SCHEMA)
 
+        print(f"output_delta_path={self.output_delta_path!r} persist_raw_html={self.persist_raw_html} len(raw_rows)={len(raw_rows)}")  # DEBUG
         if self.output_delta_path and self.persist_raw_html and raw_rows:
             raw_df = pd.DataFrame(raw_rows)
             _spark_write(raw_df, self.output_delta_path + "_raw", _RAW_SCHEMA)
