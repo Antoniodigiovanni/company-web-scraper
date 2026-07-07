@@ -1,42 +1,51 @@
 from __future__ import annotations
 
 import random
-import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, Sequence, cast
 from urllib.parse import urlparse
 
 import pandas as pd
 import trafilatura
+from curl_cffi import BrowserTypeLiteral
 from curl_cffi import requests as cffi_requests
 from lxml import html as lxml_html
 
+# Setup Variables
+# File extensions treated as binary/non-page content; used to exclude non-HTML links during subpage discovery.
 _BINARY_EXTS = frozenset([
     ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp",
     ".zip", ".tar", ".gz", ".doc", ".docx", ".xls", ".xlsx",
     ".ppt", ".pptx", ".css", ".js", ".xml", ".json", ".ico",
 ])
+# HTTP status codes treated as bot-blocking signals that trigger a retry or JS escalation.
 _BLOCKING_STATUSES = frozenset([403, 429, 503])
+# Substrings in extracted page text that indicate a bot-challenge/interstitial rather than real content.
 _HARD_BLOCK_PATTERNS = [
     "just a moment", "access denied", "attention required",
     "checking your browser", "captcha", "robot verification",
 ]
+# XML namespace used when parsing sitemap.xml documents.
 _SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+# Minimum extracted-text length below which a page is considered empty/JS-rendered and eligible for escalation.
 _MIN_TEXT_LEN = 200
 
-_DEFAULT_HIGH = [
+# Default URL path keywords that boost a candidate subpage's ranking score (+2 each).
+DEFAULT_HIGH_VALUE_KEYWORDS = (
     "about", "about-us", "company", "who-we-are", "what-we-do",
     "mission", "vision", "team", "products", "product", "services",
     "solutions", "technology", "platform", "industries", "customers",
     "case-studies",
-]
-_DEFAULT_LOW = [
+)
+# Default URL path keywords that penalize a candidate subpage's ranking score (-1 each).
+DEFAULT_LOW_VALUE_KEYWORDS = (
     "careers", "jobs", "press", "blog", "news", "events", "contact",
     "legal", "privacy", "terms", "cookie", "login", "signin", "signup", "cart",
-]
+)
+# CSS selectors for cookie-consent "accept" buttons, tried in order during Playwright fetches.
 _CONSENT_SELECTORS = [
     "#onetrust-accept-btn-handler",
     "button:has-text('Accept all')",
@@ -47,6 +56,7 @@ _CONSENT_SELECTORS = [
 ]
 
 # Spark schema strings (used with spark.createDataFrame schema parameter)
+# Schema for the main per-company results table written by CompanyScraper.scrape().
 _RESULTS_SCHEMA = """
     id string, url string, combined_text string,
     num_pages_tried int, num_pages_ok int,
@@ -56,6 +66,7 @@ _RESULTS_SCHEMA = """
     total_time_s double, ts timestamp
 """
 
+# Schema for the per-company summary log table (one row per scrape call, no page-level detail).
 _LOG_SCHEMA = """
     id string, url string, ts timestamp,
     status string, subpages_tried int, subpages_ok int,
@@ -63,6 +74,7 @@ _LOG_SCHEMA = """
     total_time_s double, error string
 """
 
+# Schema for the optional raw-HTML table, one row per fetched page.
 _RAW_SCHEMA = """
     id string, url string, page_url string,
     html string, fetched_at timestamp, escalated_to_js boolean
@@ -145,7 +157,7 @@ def _filter_urls(urls: list[str], base_host: str) -> list[str]:
     return result
 
 
-def _score_url(path: str, high_kw: list[str], low_kw: list[str]) -> int:
+def _score_url(path: str, high_kw: Sequence[str], low_kw: Sequence[str]) -> int:
     """Scores a URL path based on keyword matching. High keywords return +2, low return -1, else 0. High wins over low."""
     lower = path.lower()
     if any(kw in lower for kw in high_kw):
@@ -156,10 +168,11 @@ def _score_url(path: str, high_kw: list[str], low_kw: list[str]) -> int:
 
 
 def _rank_and_pick(
-    urls: list[str], high_kw: list[str], low_kw: list[str], max_count: int
+    urls: list[str], high_kw: Sequence[str], low_kw: Sequence[str], max_count: int
 ) -> list[str]:
     """Ranks URLs by score (descending) then by path depth (ascending), returns top max_count URLs."""
     def sort_key(url: str):
+        """Sort key: higher score first, shallower path first."""
         path = urlparse(url).path
         score = _score_url(path, high_kw, low_kw)
         depth = path.count("/")
@@ -171,7 +184,7 @@ def _rank_and_pick(
 def _fetch_with_retry(
     url: str,
     retry_mode: str,
-    profiles: tuple,
+    profiles: tuple[str, ...],
     timeout_s: float,
     start_profile_idx: int = 0,
 ) -> tuple[int, str, int]:
@@ -204,7 +217,7 @@ def _fetch_with_retry(
             time.sleep(sleep_s + random.uniform(0, 0.5))
 
         try:
-            session = cffi_requests.Session(impersonate=profile)
+            session = cffi_requests.Session(impersonate=cast(BrowserTypeLiteral, profile))
             resp = session.get(url, timeout=timeout_s)
             last_status = resp.status_code
             last_html = resp.text
@@ -235,6 +248,29 @@ def _extract_text(html: str) -> str:
     return result or ""
 
 
+def _failed_result(row_id, url: str, error: str) -> dict:
+    """Builds a result dict, matching _scrape_company's output schema, for a company whose scrape raised an unhandled exception."""
+    try:
+        normalized_url = _normalize_url(url)
+    except Exception:
+        normalized_url = url
+    return {
+        "id": row_id,
+        "url": normalized_url,
+        "combined_text": "",
+        "num_pages_tried": 0,
+        "num_pages_ok": 0,
+        "pages": [],
+        "escalated_to_js": False,
+        "retries_used": 0,
+        "status": "failed",
+        "error": error,
+        "total_time_s": 0.0,
+        "ts": datetime.now(timezone.utc),
+        "_raw_rows": [],
+    }
+
+
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -250,9 +286,12 @@ class CompanyScraper:
 
     Args:
         max_subpages: Total pages to scrape per company (including homepage). Default 8.
-        high_value_keywords: URL path keywords scoring +2. Defaults to _DEFAULT_HIGH.
-        low_value_keywords: URL path keywords scoring -1. Defaults to _DEFAULT_LOW.
-        retry_mode: "none" | "minimal" | "full". See module docstring.
+        high_value_keywords: URL path keywords scoring +2. Defaults to DEFAULT_HIGH_VALUE_KEYWORDS.
+        low_value_keywords: URL path keywords scoring -1. Defaults to DEFAULT_LOW_VALUE_KEYWORDS.
+        retry_mode: "none" (1 attempt, escalate immediately on block/error) |
+            "minimal" (1 attempt + 1 retry on a different browser profile, then escalate) |
+            "full" (2 same-profile retries, then 2 more on rotating profiles, then escalate).
+            See README.md for the full behaviour table.
         impersonate_profiles: curl_cffi impersonation profiles to rotate through.
         timeout_s: Per-request timeout in seconds.
         subpage_workers: ThreadPoolExecutor workers for parallel subpage fetching.
@@ -267,10 +306,10 @@ class CompanyScraper:
     def __init__(
         self,
         max_subpages: int = 8,
-        high_value_keywords: list[str] | None = None,
-        low_value_keywords: list[str] | None = None,
+        high_value_keywords: tuple[str, ...] = DEFAULT_HIGH_VALUE_KEYWORDS,
+        low_value_keywords: tuple[str, ...] = DEFAULT_LOW_VALUE_KEYWORDS,
         retry_mode: Literal["none", "minimal", "full"] = "full",
-        impersonate_profiles: tuple = ("chrome124", "safari17_2", "firefox133"),
+        impersonate_profiles: tuple[str, ...] = ("chrome124", "safari17_2", "firefox133"),
         timeout_s: float = 15.0,
         subpage_workers: int = 5,
         js_fallback: bool = True,
@@ -279,6 +318,7 @@ class CompanyScraper:
         persist_raw_html: bool = False,
         spark=None,
     ) -> None:
+        """Validates the persist_raw_html/output_delta_path pairing, resolves the Spark session if a Delta path was given, and stores configuration."""
         if persist_raw_html and not output_delta_path:
             raise ValueError("persist_raw_html=True requires output_delta_path to be set.")
 
@@ -297,8 +337,8 @@ class CompanyScraper:
                 )
 
         self.max_subpages = max_subpages
-        self.high_value_keywords = high_value_keywords if high_value_keywords is not None else list(_DEFAULT_HIGH)
-        self.low_value_keywords = low_value_keywords if low_value_keywords is not None else list(_DEFAULT_LOW)
+        self.high_value_keywords = high_value_keywords
+        self.low_value_keywords = low_value_keywords
         self.retry_mode = retry_mode
         self.impersonate_profiles = tuple(impersonate_profiles)
         self.timeout_s = timeout_s
@@ -310,16 +350,31 @@ class CompanyScraper:
 
         self._browser = None
         self._playwright_ctx = None
-        self._pw_lock = threading.Lock()
+        # Playwright's sync API requires every call to originate from the single OS thread
+        # that first launched it, so all Playwright work is routed through one dedicated
+        # thread for the instance's lifetime — never called directly from subpage_workers
+        # pool threads or the calling thread.
+        self._pw_executor = ThreadPoolExecutor(max_workers=1)
 
     def close(self) -> None:
-        if getattr(self, "_browser", None) is not None:
+        """Releases the Playwright browser and its dedicated thread, if one was launched."""
+        if getattr(self, "_pw_executor", None) is not None:
+            try:
+                self._pw_executor.submit(self._close_playwright).result()
+            except Exception:
+                pass
+            self._pw_executor.shutdown(wait=True)
+            self._pw_executor = None
+
+    def _close_playwright(self) -> None:
+        """Tears down the browser/context. Must only run on the dedicated Playwright thread."""
+        if self._browser is not None:
             try:
                 self._browser.close()
             except Exception:
                 pass
             self._browser = None
-        if getattr(self, "_playwright_ctx", None) is not None:
+        if self._playwright_ctx is not None:
             try:
                 self._playwright_ctx.stop()
             except Exception:
@@ -327,12 +382,15 @@ class CompanyScraper:
             self._playwright_ctx = None
 
     def __enter__(self):
+        """Returns self so CompanyScraper can be used as a context manager."""
         return self
 
     def __exit__(self, *args):
+        """Closes the Playwright browser/context on context-manager exit."""
         self.close()
 
     def __del__(self):
+        """Best-effort cleanup of the Playwright browser if the instance is garbage-collected without an explicit close()."""
         self.close()
 
     def _discover_subpages(self, base_url: str, homepage_html: str) -> list[str]:
@@ -344,7 +402,7 @@ class CompanyScraper:
         # 1. Try sitemap.xml
         sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
         try:
-            session = cffi_requests.Session(impersonate=self.impersonate_profiles[0])
+            session = cffi_requests.Session(impersonate=cast(BrowserTypeLiteral, self.impersonate_profiles[0]))
             resp = session.get(sitemap_url, timeout=self.timeout_s)
             if resp.status_code == 200 and resp.text.strip().startswith("<"):
                 if _is_sitemap_index(resp.text):
@@ -365,7 +423,7 @@ class CompanyScraper:
         if not all_urls:
             robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
             try:
-                session = cffi_requests.Session(impersonate=self.impersonate_profiles[0])
+                session = cffi_requests.Session(impersonate=cast(BrowserTypeLiteral, self.impersonate_profiles[0]))
                 resp = session.get(robots_url, timeout=self.timeout_s)
                 if resp.status_code == 200:
                     for line in resp.text.splitlines():
@@ -464,6 +522,7 @@ class CompanyScraper:
 
         # --- Fetch subpages in parallel ---
         def fetch_subpage(subpage_url: str) -> dict:
+            """Fetches one subpage, escalating to Playwright if blocked or empty, and returns its page-metadata dict."""
             s_idx = random.randint(0, len(self.impersonate_profiles) - 1)
             status, html, retries = _fetch_with_retry(
                 subpage_url, self.retry_mode, self.impersonate_profiles, self.timeout_s, s_idx
@@ -573,6 +632,7 @@ class CompanyScraper:
         id_col: str,
         url_col: str,
     ) -> pd.DataFrame:
+        """Scrapes every row in df and returns a result DataFrame, persisting to Delta if configured."""
         results = []
         log_rows = []
         raw_rows = []
@@ -580,7 +640,12 @@ class CompanyScraper:
         for _, row in df.iterrows():
             row_id = row[id_col]
             url = str(row[url_col])
-            result = self._scrape_company(row_id, url)
+            try:
+                result = self._scrape_company(row_id, url)
+            except Exception as e:
+                # A single company's unexpected failure (e.g. a Playwright crash) must not
+                # discard every already-scraped row in the batch or skip the Delta write below.
+                result = _failed_result(row_id, url, str(e))
 
             raw = result.pop("_raw_rows", [])
             raw_rows.extend(raw)
@@ -612,7 +677,9 @@ class CompanyScraper:
         log_rows: list[dict],
         raw_rows: list[dict],
     ) -> None:
+        """Writes the results/log/raw-html DataFrames to their configured Delta table paths."""
         def _spark_write(pdf: pd.DataFrame, path: str, schema: str) -> None:
+            """Appends pdf to path as Delta under schema, retrying up to 3 times on concurrent-append conflicts."""
             sdf = self._spark.createDataFrame(pdf, schema=schema.strip())
             for attempt in range(3):
                 try:
@@ -635,48 +702,54 @@ class CompanyScraper:
             _spark_write(log_df, self.delta_log_path, _LOG_SCHEMA)
 
     def _fetch_with_playwright(self, url: str) -> str:
+        """Renders url in headless Chromium and returns the resulting HTML, always running on the instance's dedicated Playwright thread."""
         if sync_playwright is None:
             raise ImportError(
                 "Playwright is not installed. Run: pip install playwright && playwright install chromium"
             )
+        if self._pw_executor is None:
+            raise RuntimeError("CompanyScraper is closed; cannot fetch with Playwright.")
 
-        with self._pw_lock:
-            if self._playwright_ctx is None:
-                self._playwright_ctx = sync_playwright().__enter__()
-                self._browser = self._playwright_ctx.chromium.launch(headless=True)
+        return self._pw_executor.submit(self._fetch_with_playwright_impl, url).result()
 
-            page = self._browser.new_page()
-            try:
-                page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in ("image", "media", "font")
-                    else route.continue_(),
-                )
-                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-                time.sleep(1.5)
+    def _fetch_with_playwright_impl(self, url: str) -> str:
+        """Launches the browser lazily if needed and renders url. Must only run on the dedicated Playwright thread."""
+        if self._playwright_ctx is None:
+            self._playwright_ctx = sync_playwright().__enter__()
+            self._browser = self._playwright_ctx.chromium.launch(headless=True)
 
-                for selector in _CONSENT_SELECTORS:
-                    try:
-                        el = page.query_selector(selector)
-                        if el:
-                            el.click(timeout=2_000)
-                            break
-                    except Exception:
-                        continue
+        page = self._browser.new_page()
+        try:
+            page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "media", "font")
+                else route.continue_(),
+            )
+            page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            time.sleep(1.5)
 
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(0.5)
-
-                html = page.content()
-                return html
-            except Exception:
-                return ""
-            finally:
+            for selector in _CONSENT_SELECTORS:
                 try:
-                    page.close()
+                    el = page.query_selector(selector)
+                    if el:
+                        el.click(timeout=2_000)
+                        break
                 except Exception:
-                    pass
+                    continue
+
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(0.5)
+
+            html = page.content()
+            return html
+        except Exception:
+            return ""
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
