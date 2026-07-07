@@ -350,6 +350,38 @@ class TestFetchWithPlaywright:
 
         assert html == ""
 
+    @patch("scraper.sync_playwright")
+    def test_recovers_after_failed_browser_launch(self, mock_sync_playwright):
+        """A chromium.launch() failure must not permanently poison the instance.
+
+        Regression test: the lazy-init guard used to key off _playwright_ctx, so once
+        __enter__() succeeded but launch() raised, _browser stayed None forever and every
+        later call crashed with 'NoneType' object has no attribute 'new_page'.
+        """
+        mock_ctx = MagicMock()
+        mock_sync_playwright.return_value.__enter__.return_value = mock_ctx
+
+        mock_page = MagicMock()
+        mock_page.content.return_value = (
+            "<html><body>enough text here to pass the length check for sure yes definitely enough words</body></html>"
+        )
+        mock_page.query_selector.return_value = None
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = mock_page
+
+        # First launch attempt fails (e.g. Chromium crashed/missing), second succeeds.
+        mock_ctx.chromium.launch.side_effect = [Exception("Chromium crashed"), mock_browser]
+
+        with CompanyScraper(js_fallback=True) as s:
+            with pytest.raises(Exception, match="Chromium crashed"):
+                s._fetch_with_playwright("https://example.com")
+
+            # Must retry the launch on the next call instead of crashing on new_page().
+            html = s._fetch_with_playwright("https://example.com")
+
+        assert "<body>" in html
+        assert mock_ctx.chromium.launch.call_count == 2
+
     def test_raises_import_error_when_playwright_not_installed(self):
         import scraper as scraper_mod
         original = scraper_mod.sync_playwright

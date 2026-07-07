@@ -727,8 +727,13 @@ class CompanyScraper:
 
     def _fetch_with_playwright_impl(self, url: str) -> str:
         """Launches the browser lazily if needed and renders url. Must only run on the dedicated Playwright thread."""
-        if self._playwright_ctx is None:
-            self._playwright_ctx = sync_playwright().__enter__()
+        if self._browser is None:
+            # Gated on _browser, not _playwright_ctx: if chromium.launch() previously raised
+            # (e.g. Chromium missing/crashed), _playwright_ctx would already be set while
+            # _browser stayed None, permanently skipping re-launch and crashing new_page()
+            # with 'NoneType' object has no attribute 'new_page' on every later call.
+            if self._playwright_ctx is None:
+                self._playwright_ctx = sync_playwright().__enter__()
             self._browser = self._playwright_ctx.chromium.launch(headless=True)
 
         page = self._browser.new_page()
@@ -766,6 +771,7 @@ class CompanyScraper:
 
 
 if __name__ == "__main__":
+    "Example run for the script"
     import sys
 
     test_sites = [
