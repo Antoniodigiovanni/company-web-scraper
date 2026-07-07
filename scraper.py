@@ -304,6 +304,8 @@ class CompanyScraper:
         persist_raw_html: If True, write raw HTML to a second Delta target derived from
             output_delta_path (path + "_raw", or table name + "_raw"). Requires output_delta_path.
         spark: SparkSession to use. If None, uses SparkSession.getActiveSession().
+        verbose: If True, print per-company progress — JS escalations, hard-block detections,
+            and Delta write attempts/results.
     """
 
     def __init__(
@@ -320,6 +322,7 @@ class CompanyScraper:
         delta_log_path: str | None = None,
         persist_raw_html: bool = False,
         spark=None,
+        verbose: bool = False,
     ) -> None:
         """Validates the persist_raw_html/output_delta_path pairing, resolves the Spark session if a Delta path was given, and stores configuration."""
         if persist_raw_html and not output_delta_path:
@@ -350,6 +353,7 @@ class CompanyScraper:
         self.output_delta_path = output_delta_path
         self.delta_log_path = delta_log_path
         self.persist_raw_html = persist_raw_html
+        self.verbose = verbose
 
         self._browser = None
         self._playwright_ctx = None
@@ -467,6 +471,8 @@ class CompanyScraper:
 
         if hp_status in _BLOCKING_STATUSES or hp_status == 0:
             if self.js_fallback:
+                if self.verbose:
+                    print(f"[{row_id}] homepage blocked (HTTP {hp_status}), escalating to Playwright")
                 hp_html = self._fetch_with_playwright(url)
                 hp_escalated = True
                 escalated_any = True
@@ -474,6 +480,8 @@ class CompanyScraper:
         hp_text = _extract_text(hp_html)
 
         if (not hp_text or len(hp_text) < _MIN_TEXT_LEN) and self.js_fallback and not hp_escalated:
+            if self.verbose:
+                print(f"[{row_id}] homepage text too short ({len(hp_text)} chars), escalating to Playwright")
             hp_html = self._fetch_with_playwright(url)
             hp_escalated = True
             escalated_any = True
@@ -483,6 +491,8 @@ class CompanyScraper:
         if hp_escalated and hp_text:
             lower = hp_text.lower()
             if len(hp_text) < _MIN_TEXT_LEN or any(p in lower for p in _HARD_BLOCK_PATTERNS):
+                if self.verbose:
+                    print(f"[{row_id}] homepage hard-block detected after Playwright, discarding text")
                 hp_text = ""
 
         hp_fetched_at = datetime.now(timezone.utc)
@@ -505,6 +515,8 @@ class CompanyScraper:
 
         if not candidate_urls and self.js_fallback and not hp_escalated:
             # SPA: escalate homepage to get links
+            if self.verbose:
+                print(f"[{row_id}] no links discovered, escalating homepage to Playwright (SPA)")
             hp_html = self._fetch_with_playwright(url)
             hp_escalated = True
             escalated_any = True
@@ -533,16 +545,22 @@ class CompanyScraper:
             escalated = False
             if status in _BLOCKING_STATUSES or status == 0:
                 if self.js_fallback:
+                    if self.verbose:
+                        print(f"[{row_id}] {subpage_url} blocked (HTTP {status}), escalating to Playwright")
                     html = self._fetch_with_playwright(subpage_url)
                     escalated = True
             text = _extract_text(html)
             if (not text or len(text) < _MIN_TEXT_LEN) and self.js_fallback and not escalated:
+                if self.verbose:
+                    print(f"[{row_id}] {subpage_url} text too short ({len(text)} chars), escalating to Playwright")
                 html = self._fetch_with_playwright(subpage_url)
                 escalated = True
                 text = _extract_text(html)
             if escalated and text:
                 lower = text.lower()
                 if len(text) < _MIN_TEXT_LEN or any(p in lower for p in _HARD_BLOCK_PATTERNS):
+                    if self.verbose:
+                        print(f"[{row_id}] {subpage_url} hard-block detected after Playwright, discarding text")
                     text = ""
             return {
                 "url": subpage_url,
@@ -593,6 +611,12 @@ class CompanyScraper:
             status_str = "partial"
         else:
             status_str = "ok"
+
+        if self.verbose:
+            print(
+                f"[{row_id}] done: status={status_str} pages_ok={num_ok}/{len(pages_meta)} "
+                f"escalated_to_js={escalated_any} retries_used={total_retries}"
+            )
 
         return {
             "id": row_id,
@@ -652,7 +676,8 @@ class CompanyScraper:
 
             raw = result.pop("_raw_rows", [])
             raw_rows.extend(raw)
-            print(f"[{row_id}] status={result['status']} raw_pages_collected={len(raw)}")  # DEBUG
+            if self.verbose:
+                print(f"[{row_id}] status={result['status']} raw_pages_collected={len(raw)}")
 
             log_rows.append({
                 "id": row_id,
@@ -691,7 +716,8 @@ class CompanyScraper:
             """
             sdf = self._spark.createDataFrame(pdf, schema=schema.strip())
             is_table_name = "/" not in target
-            print(f"writing {len(pdf)} rows to target={target!r} (is_table_name={is_table_name})")  # DEBUG
+            if self.verbose:
+                print(f"writing {len(pdf)} rows to target={target!r} (is_table_name={is_table_name})")
             for attempt in range(3):
                 try:
                     writer = sdf.write.format("delta").mode("append")
@@ -699,7 +725,8 @@ class CompanyScraper:
                         writer.saveAsTable(target)
                     else:
                         writer.save(target)
-                    print(f"write succeeded: {target!r}")  # DEBUG
+                    if self.verbose:
+                        print(f"write succeeded: {target!r}")
                     return
                 except Exception as e:
                     if "ConcurrentAppendException" not in str(e) or attempt == 2:
@@ -709,7 +736,11 @@ class CompanyScraper:
         if self.output_delta_path:
             _spark_write(result_df, self.output_delta_path, _RESULTS_SCHEMA)
 
-        print(f"output_delta_path={self.output_delta_path!r} persist_raw_html={self.persist_raw_html} len(raw_rows)={len(raw_rows)}")  # DEBUG
+        if self.verbose:
+            print(
+                f"output_delta_path={self.output_delta_path!r} "
+                f"persist_raw_html={self.persist_raw_html} len(raw_rows)={len(raw_rows)}"
+            )
         if self.output_delta_path and self.persist_raw_html and raw_rows:
             raw_df = pd.DataFrame(raw_rows)
             _spark_write(raw_df, self.output_delta_path + "_raw", _RAW_SCHEMA)
