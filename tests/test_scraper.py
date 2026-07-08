@@ -14,8 +14,8 @@ from scraper import CompanyScraper
 
 
 def test_module_imports():
-    assert hasattr(scraper, "_DEFAULT_HIGH")
-    assert hasattr(scraper, "_DEFAULT_LOW")
+    assert hasattr(scraper, "DEFAULT_HIGH_VALUE_KEYWORDS")
+    assert hasattr(scraper, "DEFAULT_LOW_VALUE_KEYWORDS")
 
 
 class TestNormalizeUrl:
@@ -350,6 +350,38 @@ class TestFetchWithPlaywright:
 
         assert html == ""
 
+    @patch("scraper.sync_playwright")
+    def test_recovers_after_failed_browser_launch(self, mock_sync_playwright):
+        """A chromium.launch() failure must not permanently poison the instance.
+
+        Regression test: the lazy-init guard used to key off _playwright_ctx, so once
+        __enter__() succeeded but launch() raised, _browser stayed None forever and every
+        later call crashed with 'NoneType' object has no attribute 'new_page'.
+        """
+        mock_ctx = MagicMock()
+        mock_sync_playwright.return_value.__enter__.return_value = mock_ctx
+
+        mock_page = MagicMock()
+        mock_page.content.return_value = (
+            "<html><body>enough text here to pass the length check for sure yes definitely enough words</body></html>"
+        )
+        mock_page.query_selector.return_value = None
+        mock_browser = MagicMock()
+        mock_browser.new_page.return_value = mock_page
+
+        # First launch attempt fails (e.g. Chromium crashed/missing), second succeeds.
+        mock_ctx.chromium.launch.side_effect = [Exception("Chromium crashed"), mock_browser]
+
+        with CompanyScraper(js_fallback=True) as s:
+            with pytest.raises(Exception, match="Chromium crashed"):
+                s._fetch_with_playwright("https://example.com")
+
+            # Must retry the launch on the next call instead of crashing on new_page().
+            html = s._fetch_with_playwright("https://example.com")
+
+        assert "<body>" in html
+        assert mock_ctx.chromium.launch.call_count == 2
+
     def test_raises_import_error_when_playwright_not_installed(self):
         import scraper as scraper_mod
         original = scraper_mod.sync_playwright
@@ -397,6 +429,53 @@ class TestFetchWithPlaywright:
             assert not errors, f"Threads raised: {errors}"
             # Browser should have been launched exactly once
             assert mock_ctx.chromium.launch.call_count == 1
+        finally:
+            scraper_mod.sync_playwright = original
+            s.close()
+
+    def test_playwright_work_always_runs_on_one_dedicated_thread(self):
+        """Real Playwright requires every call to originate from the same OS thread that
+        launched it. Even when _fetch_with_playwright is called from several different
+        caller threads, the actual browser work must always execute on one thread."""
+        import threading as _threading
+
+        seen_thread_ids = []
+
+        mock_pw = MagicMock()
+        mock_ctx = MagicMock()
+        mock_browser = MagicMock()
+        mock_page = MagicMock()
+        mock_pw.return_value.__enter__ = MagicMock(return_value=mock_ctx)
+        mock_ctx.chromium.launch.return_value = mock_browser
+
+        def fake_new_page():
+            seen_thread_ids.append(_threading.get_ident())
+            return mock_page
+
+        mock_browser.new_page.side_effect = fake_new_page
+        mock_page.content.return_value = (
+            "<html><body>enough text here to pass the length check for sure yes definitely enough words</body></html>"
+        )
+        mock_page.query_selector.return_value = None
+
+        import scraper as scraper_mod
+        original = scraper_mod.sync_playwright
+        scraper_mod.sync_playwright = mock_pw
+        try:
+            s = CompanyScraper(js_fallback=True)
+
+            def call_pw():
+                s._fetch_with_playwright("https://example.com")
+
+            threads = [_threading.Thread(target=call_pw) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            # 3 different Python threads called in, but the underlying Playwright work
+            # must always land on the single dedicated thread.
+            assert len(set(seen_thread_ids)) == 1
         finally:
             scraper_mod.sync_playwright = original
             s.close()
@@ -585,6 +664,39 @@ class TestScrapeMethod:
             result = s.scrape(df, id_col="company_id", url_col="site")
         assert result.iloc[0]["id"] == 42
 
+    def test_unhandled_exception_in_one_row_does_not_abort_batch(self):
+        """A crash on one company must not discard the other rows in the same scrape() call."""
+        def fake_result(row_id, url):
+            return {
+                "id": row_id, "url": url, "combined_text": "ok text",
+                "num_pages_tried": 1, "num_pages_ok": 1, "pages": [],
+                "escalated_to_js": False, "retries_used": 0,
+                "status": "ok", "error": None, "total_time_s": 0.1,
+                "ts": datetime.now(timezone.utc), "_raw_rows": [],
+            }
+
+        def flaky(row_id, url):
+            if row_id == "boom":
+                raise RuntimeError("simulated crash")
+            return fake_result(row_id, url)
+
+        s = CompanyScraper(js_fallback=False)
+        df = pd.DataFrame([
+            {"id": "ok1", "url": "https://good1.example.com"},
+            {"id": "boom", "url": "https://bad.example.com"},
+            {"id": "ok2", "url": "https://good2.example.com"},
+        ])
+        with patch.object(s, "_scrape_company", side_effect=flaky):
+            result = s.scrape(df, id_col="id", url_col="url")
+        s.close()
+
+        assert list(result["id"]) == ["ok1", "boom", "ok2"]
+        assert result.loc[result["id"] == "ok1", "status"].iloc[0] == "ok"
+        assert result.loc[result["id"] == "ok2", "status"].iloc[0] == "ok"
+        boom_row = result.loc[result["id"] == "boom"].iloc[0]
+        assert boom_row["status"] == "failed"
+        assert "simulated crash" in boom_row["error"]
+
 
 class TestWriteDelta:
     def _make_result_df(self):
@@ -624,6 +736,28 @@ class TestWriteDelta:
         assert write_call.called
         save_args = write_call.call_args[0]
         assert "/tmp/results" in save_args[0]
+
+    @patch("scraper.cffi_requests.Session")
+    def test_write_delta_uses_saveAsTable_for_unity_catalog_table_name(self, MockSession):
+        """A target with no '/' is a catalog.schema.table name, not a path, and must use saveAsTable."""
+        mock_spark = MagicMock()
+        mock_spark_df = MagicMock()
+        mock_spark.createDataFrame.return_value = mock_spark_df
+
+        MockSession.return_value.get.return_value = _make_response(404)
+
+        with CompanyScraper(
+            js_fallback=False, max_subpages=1,
+            output_delta_path="cbdm_uat_peer_model_tmp.example_scraper", spark=mock_spark,
+        ) as s:
+            df_in = pd.DataFrame([{"id": "C1", "url": "https://x.com"}])
+            s.scrape(df_in, id_col="id", url_col="url")
+
+        save_as_table_call = mock_spark_df.write.format.return_value.mode.return_value.saveAsTable
+        assert save_as_table_call.called
+        assert save_as_table_call.call_args[0][0] == "cbdm_uat_peer_model_tmp.example_scraper"
+        # Must never fall back to path-based save() for a table name.
+        assert not mock_spark_df.write.format.return_value.mode.return_value.save.called
 
     @patch("scraper.cffi_requests.Session")
     def test_write_delta_retries_on_concurrent_exception(self, MockSession):

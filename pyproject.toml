@@ -3,7 +3,7 @@ name = "company-web-scraper"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "curl_cffi>=0.7",
+    "curl_cffi>=0.10",
     "trafilatura>=1.12",
     "lxml",
     "pandas",
@@ -12,6 +12,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.3.0",
+    "jupyter>=1.1.1",
     "pytest",
 ]
 

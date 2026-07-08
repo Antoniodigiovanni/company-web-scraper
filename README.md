@@ -9,7 +9,7 @@ Scrapes the useful text from a company's public website so a downstream step can
 ## Installation
 
 ```bash
-pip install curl_cffi>=0.7 trafilatura>=1.12 lxml pandas
+pip install curl_cffi>=0.10 trafilatura>=1.12 lxml pandas
 # Playwright is optional but required when js_fallback=True triggers
 pip install playwright && playwright install chromium
 ```
@@ -35,7 +35,7 @@ with CompanyScraper() as s:
 print(results[["id", "status", "num_pages_ok", "combined_text"]].head())
 ```
 
-`CompanyScraper` is a context manager. You can also call `.close()` manually or reuse one instance across many `.scrape()` calls in a single thread.
+`CompanyScraper` is a context manager. You can also call `.close()` manually or reuse one instance across many `.scrape()` calls — Playwright work is always routed through the instance's own dedicated thread internally, so `.scrape()` can safely be called from any thread.
 
 ---
 
@@ -78,15 +78,15 @@ One row per input company.
 ```python
 CompanyScraper(
     max_subpages=8,
-    high_value_keywords=None,     # list[str] — default provided
-    low_value_keywords=None,      # list[str] — default provided
+    high_value_keywords=DEFAULT_HIGH_VALUE_KEYWORDS,   # tuple[str, ...]
+    low_value_keywords=DEFAULT_LOW_VALUE_KEYWORDS,     # tuple[str, ...]
     retry_mode="full",            # "none" | "minimal" | "full"
     impersonate_profiles=("chrome124", "safari17_2", "firefox133"),
     timeout_s=15.0,
     subpage_workers=5,
     js_fallback=True,
-    output_delta_path=None,       # Delta table path for results
-    delta_log_path=None,          # Delta table path for per-scrape logs
+    output_delta_path=None,       # Delta path or Unity Catalog table name for results
+    delta_log_path=None,          # Delta path or Unity Catalog table name for per-scrape logs
     persist_raw_html=False,       # requires output_delta_path
     spark=None,                   # SparkSession; auto-detected on Databricks
 )
@@ -98,7 +98,13 @@ Maximum pages scraped per company, including the homepage. The scraper always fe
 
 ### `high_value_keywords` / `low_value_keywords`
 
-Lists of path substrings used to rank candidate subpages. Each keyword is matched case-insensitively against the URL path.
+Sequences of path substrings used to rank candidate subpages. Each keyword is matched case-insensitively against the URL path. Defaults are exposed as `scraper.DEFAULT_HIGH_VALUE_KEYWORDS` / `scraper.DEFAULT_LOW_VALUE_KEYWORDS`, so you can extend rather than replace them:
+
+```python
+from scraper import DEFAULT_HIGH_VALUE_KEYWORDS
+
+CompanyScraper(high_value_keywords=DEFAULT_HIGH_VALUE_KEYWORDS + ("careers-page",))
+```
 
 - **+2** for any `high_value_keywords` match
 - **−1** for any `low_value_keywords` match
@@ -153,6 +159,21 @@ Set to `False` to disable Playwright entirely (useful in environments where Chro
 
 When `True`, raw HTML for every fetched page is written to a separate Delta table at `{output_delta_path}_raw`. Requires `output_delta_path` to be set.
 
+### `output_delta_path` / `delta_log_path`: path vs. Unity Catalog table name
+
+Both accept either form, detected automatically — a value containing `/` is treated as a filesystem/Delta path and written with `.save()`; a value with no `/` is treated as a Unity Catalog table name (`catalog.schema.table` or `schema.table`) and written with `.saveAsTable()`.
+
+```python
+# Path-based (DBFS, Volumes, cloud storage)
+CompanyScraper(output_delta_path="dbfs:/mnt/data/scrape_results")
+CompanyScraper(output_delta_path="/Volumes/my_catalog/my_schema/my_volume/scrape_results")
+
+# Unity Catalog managed table
+CompanyScraper(output_delta_path="my_catalog.my_schema.scrape_results")
+```
+
+Passing a table name to a path-only API (or vice versa) is the cause of Spark errors like `Path must be absolute: my_catalog.my_schema/_delta_log` — that message means a table name was handed to a path-based writer.
+
 ---
 
 ## Databricks
@@ -162,7 +183,7 @@ When `True`, raw HTML for every fetched page is written to a separate Delta tabl
 Install dependencies in a notebook cell or cluster init script:
 
 ```python
-%pip install curl_cffi>=0.7 trafilatura>=1.12 lxml pandas playwright
+%pip install curl_cffi>=0.10 trafilatura>=1.12 lxml pandas playwright
 ```
 
 Then install the Chromium browser binary (once per cluster):
@@ -262,6 +283,11 @@ already_done = spark.read.format("delta").load("dbfs:/mnt/data/scrape_results") 
 pending = df[~df["company_id"].isin(already_done)]
 results = scraper.scrape(pending, id_col="company_id", url_col="website")
 ```
+
+For a full runnable example that combines this with batching — processing companies in
+chunks, appending each batch to Delta as it completes, and resuming from wherever a
+previous run left off — see [`example_run.py`](example_run.py), a Databricks
+notebook-format script.
 
 ---
 
