@@ -89,6 +89,7 @@ CompanyScraper(
     delta_log_path=None,          # Delta path or Unity Catalog table name for per-scrape logs
     persist_raw_html=False,       # requires output_delta_path
     spark=None,                   # SparkSession; auto-detected on Databricks
+    verbose=False,                # print per-company progress to stdout
 )
 ```
 
@@ -158,6 +159,10 @@ Set to `False` to disable Playwright entirely (useful in environments where Chro
 ### `persist_raw_html` (default: `False`)
 
 When `True`, raw HTML for every fetched page is written to a separate Delta table at `{output_delta_path}_raw`. Requires `output_delta_path` to be set.
+
+### `verbose` (default: `False`)
+
+When `True`, prints per-company progress to stdout as it happens — JS escalations, hard-block detections, and Delta write attempts/results. Useful for watching a long batch run or debugging why a specific company came back empty.
 
 ### `output_delta_path` / `delta_log_path`: path vs. Unity Catalog table name
 
@@ -283,11 +288,6 @@ already_done = spark.read.format("delta").load("dbfs:/mnt/data/scrape_results") 
 pending = df[~df["company_id"].isin(already_done)]
 results = scraper.scrape(pending, id_col="company_id", url_col="website")
 ```
-
-For a full runnable example that combines this with batching — processing companies in
-chunks, appending each batch to Delta as it completes, and resuming from wherever a
-previous run left off — see [`example_run.py`](example_run.py), a Databricks
-notebook-format script.
 
 ---
 
